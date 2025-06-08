@@ -1,0 +1,853 @@
+import cv2
+import numpy as np
+from collections import deque
+import time
+import json
+import threading
+from flask import Flask, render_template, jsonify, request
+from flask_socketio import SocketIO, emit
+import base64
+import uuid
+
+# Install required packages:
+# pip install flask flask-socketio opencv-python numpy
+# Optional: pip install fer tensorflow (for advanced emotion recognition)
+# pip install python-socketio eventlet
+
+# Global variable for FER availability
+USE_FER = False
+
+try:
+    from fer import FER
+
+    USE_FER = True
+    print("Using FER (Facial Emotion Recognition) library")
+except ImportError:
+    USE_FER = False
+    print("FER library not found. Using basic emotion detection fallback.")
+    print("To install FER: pip install fer tensorflow")
+
+# Configuration
+EMOTION_THRESHOLDS = {
+    'angry': 0.4,
+    'fear': 0.4,
+    'sad': 0.4,
+    'disgust': 0.4,
+    'happy': 0.6,
+    'surprise': 0.4,
+    'neutral': 0.3
+}
+
+MIN_CONSECUTIVE_DETECTIONS = 3
+ANALYSIS_WINDOW = 20
+
+
+class JitsiEmotionAnalyzer:
+    def __init__(self):
+        self.detection_buffer = deque(maxlen=ANALYSIS_WINDOW)
+        self.emotion_counters = {emotion: 0 for emotion in EMOTION_THRESHOLDS}
+        self.frame_count = 0
+        self.current_emotions = {}
+        self.alerts = []
+
+        # Initialize emotion detector
+        global USE_FER
+        if USE_FER:
+            try:
+                self.emotion_detector = FER(mtcnn=True)
+                print("FER emotion detector initialized successfully")
+            except Exception as e:
+                print(f"Error initializing FER: {e}")
+                self.emotion_detector = None
+                USE_FER = False
+        else:
+            self.emotion_detector = None
+
+        print("Jitsi Emotion Analyzer initialized")
+
+    def analyze_frame_from_base64(self, base64_image):
+        """Analyze emotions from base64 encoded image"""
+        try:
+            # Decode base64 image
+            if ',' in base64_image:
+                image_data = base64.b64decode(base64_image.split(',')[1])
+            else:
+                image_data = base64.b64decode(base64_image)
+
+            nparr = np.frombuffer(image_data, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+            if frame is None:
+                return {"error": "Failed to decode image"}
+
+            self.frame_count += 1
+
+            # Analyze emotions
+            emotions_data = self.detect_emotions(frame)
+            emotions_data['frame_count'] = self.frame_count
+
+            # Update internal state
+            if emotions_data.get('faces'):
+                detected_emotions = []
+                for face in emotions_data['faces']:
+                    dominant_emotion = face.get('dominant_emotion')
+                    if dominant_emotion:
+                        detected_emotions.append(dominant_emotion)
+
+                if detected_emotions:
+                    self.detection_buffer.append(detected_emotions)
+
+                    # Check for alerts
+                    alert = self.check_for_alerts()
+                    if alert:
+                        emotions_data['alert'] = alert
+
+            return emotions_data
+
+        except Exception as e:
+            print(f"Analysis error: {e}")
+            return {"error": f"Analysis failed: {str(e)}"}
+
+    def detect_emotions(self, frame):
+        """Detect emotions in frame"""
+        try:
+            global USE_FER
+            if USE_FER and self.emotion_detector:
+                return self.detect_emotions_fer(frame)
+            else:
+                return self.detect_emotions_basic(frame)
+        except Exception as e:
+            print(f"Emotion detection error: {e}")
+            return {"error": f"Emotion detection failed: {str(e)}"}
+
+    def detect_emotions_fer(self, frame):
+        """Detect emotions using FER library"""
+        try:
+            emotions = self.emotion_detector.detect_emotions(frame)
+
+            faces_data = []
+            for face_data in emotions:
+                bbox = face_data["box"]
+                emotions_dict = face_data["emotions"]
+
+                # Find dominant emotion
+                dominant_emotion = max(emotions_dict, key=emotions_dict.get)
+                confidence = emotions_dict[dominant_emotion]
+
+                face_info = {
+                    "bbox": bbox,
+                    "emotions": emotions_dict,
+                    "dominant_emotion": dominant_emotion,
+                    "confidence": confidence,
+                    "alert": confidence > EMOTION_THRESHOLDS.get(dominant_emotion, 0.5)
+                }
+                faces_data.append(face_info)
+
+            return {
+                "faces": faces_data,
+                "timestamp": time.time(),
+                "method": "FER"
+            }
+        except Exception as e:
+            print(f"FER detection error: {e}")
+            return self.detect_emotions_basic(frame)
+
+    def detect_emotions_basic(self, frame):
+        """Basic emotion detection fallback using OpenCV face detection"""
+        try:
+            # Simple face detection
+            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+
+            faces_data = []
+            for (x, y, w, h) in faces:
+                # Mock emotions for demonstration (in real implementation, you'd use a trained model)
+                emotions_dict = {
+                    'neutral': 0.5 + np.random.uniform(-0.2, 0.2),
+                    'happy': 0.2 + np.random.uniform(-0.1, 0.3),
+                    'sad': 0.1 + np.random.uniform(-0.05, 0.15),
+                    'angry': 0.1 + np.random.uniform(-0.05, 0.1),
+                    'fear': 0.05 + np.random.uniform(-0.02, 0.1),
+                    'surprise': 0.03 + np.random.uniform(-0.01, 0.1),
+                    'disgust': 0.02 + np.random.uniform(-0.01, 0.05)
+                }
+
+                # Normalize to sum to 1
+                total = sum(emotions_dict.values())
+                emotions_dict = {k: v / total for k, v in emotions_dict.items()}
+
+                dominant_emotion = max(emotions_dict, key=emotions_dict.get)
+                confidence = emotions_dict[dominant_emotion]
+
+                face_info = {
+                    "bbox": [int(x), int(y), int(w), int(h)],
+                    "emotions": emotions_dict,
+                    "dominant_emotion": dominant_emotion,
+                    "confidence": confidence,
+                    "alert": confidence > EMOTION_THRESHOLDS.get(dominant_emotion, 0.5)
+                }
+                faces_data.append(face_info)
+
+            return {
+                "faces": faces_data,
+                "timestamp": time.time(),
+                "method": "Basic OpenCV"
+            }
+        except Exception as e:
+            print(f"Basic detection error: {e}")
+            return {
+                "faces": [],
+                "timestamp": time.time(),
+                "method": "Error fallback",
+                "error": str(e)
+            }
+
+    def check_for_alerts(self):
+        """Check for persistent emotional states"""
+        if len(self.detection_buffer) >= MIN_CONSECUTIVE_DETECTIONS:
+            emotion_counts = {}
+            for emotions_list in self.detection_buffer:
+                for emotion in emotions_list:
+                    emotion_counts[emotion] = emotion_counts.get(emotion, 0) + 1
+
+            for emotion, count in emotion_counts.items():
+                if count >= MIN_CONSECUTIVE_DETECTIONS and emotion in ['angry', 'sad', 'fear', 'disgust']:
+                    alert = {
+                        "type": "persistent_emotion",
+                        "emotion": emotion,
+                        "count": count,
+                        "timestamp": time.time(),
+                        "message": f"Persistent {emotion} emotion detected ({count} occurrences in last {len(self.detection_buffer)} frames)"
+                    }
+                    return alert
+        return None
+
+
+# Flask application
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'secret-key'
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+
+analyzer = JitsiEmotionAnalyzer()
+
+
+@app.route('/')
+def index():
+    """Main page with Jitsi integration"""
+    meeting_id = str(uuid.uuid4())[:8]  # Generate random meeting ID
+    return render_template('jitsi_emotion.html', meeting_id=meeting_id)
+
+
+@app.route('/join/<meeting_id>')
+def join_meeting(meeting_id):
+    """Join a specific meeting"""
+    return render_template('jitsi_emotion.html', meeting_id=meeting_id)
+
+
+@app.route('/create_meeting')
+def create_meeting():
+    """Create a new meeting and return the link"""
+    meeting_id = str(uuid.uuid4())[:8]
+    meeting_link = f"{request.host_url}join/{meeting_id}"
+    return jsonify({
+        "meeting_id": meeting_id,
+        "meeting_link": meeting_link,
+        "jitsi_link": f"https://meet.jit.si/{meeting_id}"
+    })
+
+
+@app.route('/health')
+def health_check():
+    """Health check endpoint"""
+    global USE_FER
+    return jsonify({
+        "status": "healthy",
+        "fer_available": USE_FER,
+        "timestamp": time.time()
+    })
+
+
+@socketio.on('analyze_frame')
+def handle_frame_analysis(data):
+    """Handle frame analysis from client"""
+    try:
+        base64_image = data.get('image')
+        if not base64_image:
+            emit('analysis_result', {"error": "No image data received"})
+            return
+
+        # Analyze the frame
+        result = analyzer.analyze_frame_from_base64(base64_image)
+
+        # Emit result back to client
+        emit('analysis_result', result)
+
+        # Broadcast to all clients if there's an alert
+        if result.get('alert'):
+            socketio.emit('emotion_alert', result['alert'])
+
+    except Exception as e:
+        print(f"Frame analysis error: {e}")
+        emit('analysis_result', {"error": f"Server error: {str(e)}"})
+
+
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+    global USE_FER
+    emit('status', {
+        'message': 'Connected to emotion analysis server',
+        'fer_available': USE_FER,
+        'method': 'FER' if USE_FER else 'Basic OpenCV'
+    })
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('Client disconnected')
+
+
+def create_html_template():
+    """Create the HTML template for Jitsi integration"""
+    html_content = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Jitsi Meet with Emotion Analysis</title>
+    <script src="https://meet.jit.si/external_api.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f0f0;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 20px;
+        }
+        @media (max-width: 768px) {
+            .container {
+                grid-template-columns: 1fr;
+            }
+        }
+        .video-container {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .analysis-panel {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            height: fit-content;
+        }
+        #jitsi-container {
+            width: 100%;
+            height: 400px;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #f8f9fa;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .emotion-display {
+            margin: 10px 0;
+            padding: 10px;
+            background: #f8f9fa;
+            border-radius: 4px;
+        }
+        .emotion-bar {
+            height: 20px;
+            background: #e9ecef;
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 5px 0;
+        }
+        .emotion-fill {
+            height: 100%;
+            transition: width 0.3s ease;
+        }
+        .alert {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+            border: 1px solid #f5c6cb;
+            animation: fadeIn 0.5s;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .status.connected {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .controls {
+            margin: 20px 0;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 5px;
+            font-size: 14px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+        .meeting-info {
+            background: #e3f2fd;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin: 10px 0;
+        }
+        .stat-item {
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 4px;
+            text-align: center;
+        }
+        .method-info {
+            background: #fff3cd;
+            color: #856404;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+            border: 1px solid #ffeaa7;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="video-container">
+            <div class="meeting-info">
+                <h3>Meeting ID: {{ meeting_id }}</h3>
+                <p>Share this link: <code>{{ request.url }}</code></p>
+                <button onclick="copyLink()" style="font-size: 12px; padding: 5px 10px;">Copy Link</button>
+            </div>
+
+            <div id="jitsi-container">
+                <p>Loading Jitsi Meet...</p>
+            </div>
+
+            <div class="controls">
+                <button id="start-analysis">Start Emotion Analysis</button>
+                <button id="stop-analysis" disabled>Stop Analysis</button>
+                <button id="test-camera">Test Camera</button>
+            </div>
+        </div>
+
+        <div class="analysis-panel">
+            <h3>Emotion Analysis</h3>
+
+            <div id="status" class="status">Connecting...</div>
+
+            <div id="method-info" class="method-info" style="display: none;">
+                Detection method: <span id="detection-method">Loading...</span>
+            </div>
+
+            <div id="emotions-display">
+                <p>Start analysis to see emotions</p>
+            </div>
+
+            <div id="alerts-container">
+                <!-- Alerts will appear here -->
+            </div>
+
+            <div id="stats">
+                <h4>Statistics</h4>
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <strong id="frame-count">0</strong>
+                        <br><small>Frames</small>
+                    </div>
+                    <div class="stat-item">
+                        <strong id="face-count">0</strong>
+                        <br><small>Faces</small>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Global variables
+        let jitsiApi;
+        let socket;
+        let analysisActive = false;
+        let analysisInterval;
+        let testVideo = null;
+
+        // Initialize Jitsi Meet
+        function initJitsi() {
+            const domain = 'meet.jit.si';
+            const options = {
+                roomName: '{{ meeting_id }}',
+                width: '100%',
+                height: '400px',
+                parentNode: document.getElementById('jitsi-container'),
+                configOverwrite: {
+                    startWithAudioMuted: true,
+                    startWithVideoMuted: false,
+                },
+                interfaceConfigOverwrite: {
+                    TOOLBAR_BUTTONS: [
+                        'microphone', 'camera', 'closedcaptions', 'desktop', 'fullscreen',
+                        'fodeviceselection', 'hangup', 'profile', 'chat', 'recording',
+                        'livestreaming', 'etherpad', 'sharedvideo', 'settings', 'raisehand',
+                        'videoquality', 'filmstrip', 'invite', 'feedback', 'stats', 'shortcuts'
+                    ],
+                }
+            };
+
+            try {
+                jitsiApi = new JitsiMeetExternalAPI(domain, options);
+
+                jitsiApi.addEventListener('ready', () => {
+                    console.log('Jitsi Meet is ready');
+                    updateStatus('Jitsi Meet ready - Connect to start analysis', 'connected');
+                });
+
+                jitsiApi.addEventListener('videoConferenceJoined', () => {
+                    console.log('Joined video conference');
+                    updateStatus('Joined meeting - Ready for analysis', 'connected');
+                });
+
+            } catch (error) {
+                console.error('Error initializing Jitsi:', error);
+                updateStatus('Error loading Jitsi Meet', 'error');
+            }
+        }
+
+        // Initialize Socket.IO
+        function initSocket() {
+            socket = io();
+
+            socket.on('connect', () => {
+                console.log('Connected to analysis server');
+                updateStatus('Connected to analysis server', 'connected');
+            });
+
+            socket.on('status', (data) => {
+                console.log('Server status:', data);
+                if (data.method) {
+                    document.getElementById('detection-method').textContent = data.method;
+                    document.getElementById('method-info').style.display = 'block';
+                }
+            });
+
+            socket.on('analysis_result', (data) => {
+                displayEmotions(data);
+            });
+
+            socket.on('emotion_alert', (alert) => {
+                displayAlert(alert);
+            });
+
+            socket.on('disconnect', () => {
+                updateStatus('Disconnected from server', 'error');
+            });
+        }
+
+        // Update status display
+        function updateStatus(message, type) {
+            const statusEl = document.getElementById('status');
+            statusEl.textContent = message;
+            statusEl.className = `status ${type}`;
+        }
+
+        // Capture video frame and send for analysis
+        function captureAndAnalyze() {
+            if (!analysisActive) return;
+
+            try {
+                let videoElement = null;
+
+                // Try to get video from test camera first
+                if (testVideo && !testVideo.paused) {
+                    videoElement = testVideo;
+                } else {
+                    // Try to get video from Jitsi
+                    const videoElements = document.querySelectorAll('video');
+                    for (let video of videoElements) {
+                        if (video.srcObject && video.videoWidth > 0) {
+                            videoElement = video;
+                            break;
+                        }
+                    }
+                }
+
+                if (!videoElement) {
+                    console.log('No video source found');
+                    return;
+                }
+
+                // Create canvas to capture frame
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                canvas.width = videoElement.videoWidth || 640;
+                canvas.height = videoElement.videoHeight || 480;
+
+                // Draw video frame to canvas
+                ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+
+                // Convert to base64 and send
+                const imageData = canvas.toDataURL('image/jpeg', 0.8);
+                socket.emit('analyze_frame', { image: imageData });
+
+            } catch (error) {
+                console.error('Error capturing frame:', error);
+            }
+        }
+
+        // Test camera access
+        async function testCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+
+                if (testVideo) {
+                    testVideo.remove();
+                }
+
+                testVideo = document.createElement('video');
+                testVideo.srcObject = stream;
+                testVideo.autoplay = true;
+                testVideo.muted = true;
+                testVideo.style.width = '100%';
+                testVideo.style.height = '200px';
+                testVideo.style.objectFit = 'cover';
+                testVideo.style.borderRadius = '4px';
+                testVideo.style.marginTop = '10px';
+
+                document.getElementById('jitsi-container').appendChild(testVideo);
+                updateStatus('Camera test active - Start analysis to test emotion detection', 'connected');
+
+            } catch (error) {
+                console.error('Camera access error:', error);
+                updateStatus('Camera access denied or unavailable', 'error');
+            }
+        }
+
+        // Display emotions
+        function displayEmotions(data) {
+            const container = document.getElementById('emotions-display');
+
+            if (data.error) {
+                container.innerHTML = `<div class="status error">Error: ${data.error}</div>`;
+                return;
+            }
+
+            if (!data.faces || data.faces.length === 0) {
+                container.innerHTML = '<p>No faces detected</p>';
+                document.getElementById('face-count').textContent = '0';
+                return;
+            }
+
+            document.getElementById('face-count').textContent = data.faces.length;
+            document.getElementById('frame-count').textContent = data.frame_count || 0;
+
+            let html = '';
+            data.faces.forEach((face, index) => {
+                html += `<div class="emotion-display">
+                    <h4>Face ${index + 1}</h4>
+                    <p><strong>Main:</strong> ${face.dominant_emotion} (${(face.confidence * 100).toFixed(1)}%)</p>`;
+
+                // Sort emotions by confidence
+                const sortedEmotions = Object.entries(face.emotions)
+                    .sort(([,a], [,b]) => b - a)
+                    .slice(0, 4); // Show top 4 emotions
+
+                sortedEmotions.forEach(([emotion, confidence]) => {
+                    const percentage = (confidence * 100).toFixed(1);
+                    const color = getEmotionColor(emotion);
+                    html += `
+                        <div>
+                            <span>${emotion}: ${percentage}%</span>
+                            <div class="emotion-bar">
+                                <div class="emotion-fill" style="width: ${percentage}%; background-color: ${color};"></div>
+                            </div>
+                        </div>`;
+                });
+
+                html += '</div>';
+            });
+
+            container.innerHTML = html;
+        }
+
+        // Display alerts
+        function displayAlert(alert) {
+            const container = document.getElementById('alerts-container');
+            const alertDiv = document.createElement('div');
+            alertDiv.className = 'alert';
+            alertDiv.innerHTML = `
+                <strong>WARNING Alert:</strong> ${alert.message}
+                <br><small>Time: ${new Date(alert.timestamp * 1000).toLocaleTimeString()}</small>
+            `;
+            container.insertBefore(alertDiv, container.firstChild);
+
+            // Remove old alerts (keep only 3)
+            while (container.children.length > 3) {
+                container.removeChild(container.lastChild);
+            }
+
+            // Auto-remove alert after 10 seconds
+            setTimeout(() => {
+                if (alertDiv.parentNode) {
+                    alertDiv.remove();
+                }
+            }, 10000);
+        }
+
+        // Get color for emotion
+        function getEmotionColor(emotion) {
+            const colors = {
+                'happy': '#28a745',
+                'sad': '#6f42c1',
+                'angry': '#dc3545',
+                'fear': '#fd7e14',
+                'surprise': '#20c997',
+                'disgust': '#6c757d',
+                'neutral': '#007bff'
+            };
+            return colors[emotion] || '#6c757d';
+        }
+
+        // Copy meeting link
+        function copyLink() {
+            const link = window.location.href;
+            navigator.clipboard.writeText(link).then(() => {
+                alert('Meeting link copied to clipboard!');
+            }).catch(() => {
+                // Fallback for older browsers
+                const textArea = document.createElement('textarea');
+                textArea.value = link;
+                document.body.appendChild(textArea);
+                textArea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textArea);
+                alert('Meeting link copied to clipboard!');
+            });
+        }
+
+        // Event listeners
+        document.getElementById('start-analysis').addEventListener('click', () => {
+            analysisActive = true;
+            analysisInterval = setInterval(captureAndAnalyze, 2000); // Analyze every 2 seconds
+            document.getElementById('start-analysis').disabled = true;
+            document.getElementById('stop-analysis').disabled = false;
+            updateStatus('Analysis active', 'connected');
+        });
+
+        document.getElementById('stop-analysis').addEventListener('click', () => {
+            analysisActive = false;
+            if (analysisInterval) clearInterval(analysisInterval);
+            document.getElementById('start-analysis').disabled = false;
+            document.getElementById('stop-analysis').disabled = true;
+            updateStatus('Analysis stopped', 'connected');
+        });
+
+        document.getElementById('test-camera').addEventListener('click', testCamera);
+
+        // Initialize everything
+        document.addEventListener('DOMContentLoaded', () => {
+            initSocket();
+            // Delay Jitsi initialization to ensure DOM is ready
+            setTimeout(initJitsi, 1000);
+        });
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            if (testVideo && testVideo.srcObject) {
+                testVideo.srcObject.getTracks().forEach(track => track.stop());
+            }
+        });
+    </script>
+</body>
+</html>'''
+
+    # Create templates directory
+    import os
+    os.makedirs('templates', exist_ok=True)
+
+    # Write template file with UTF-8 encoding
+    with open('templates/jitsi_emotion.html', 'w', encoding='utf-8') as f:
+        f.write(html_content)
+
+
+def main():
+    """Main function to run the application"""
+    print("Setting up Emotion Analyzer...")
+
+    # Create HTML template
+    create_html_template()
+
+    print("\n" + "=" * 60)
+    print("JITSI MEET EMOTION ANALYZER")
+    print("=" * 60)
+    print("Server starting...")
+    print("Access the application at: http://localhost:5000")
+    print("\nFeatures:")
+    print("- Create meeting links for customers")
+    print("- Real-time emotion analysis")
+    print("- Alert system for persistent emotions")
+    print("- Web-based interface")
+    if not USE_FER:
+        print("\nNote: Using basic emotion detection.")
+        print("For advanced detection, install: pip install fer tensorflow")
+    print("=" * 60)
+
+    # Run Flask app with allow_unsafe_werkzeug for development
+    try:
+        socketio.run(
+            app,
+            host='0.0.0.0',
+            port=5000,
+            debug=False,
+            allow_unsafe_werkzeug=True  # This fixes the production error
+        )
+    except Exception as e:
+        print(f"Error starting server: {e}")
+        print("Try installing eventlet: pip install eventlet")
+
+
+if __name__ == "__main__":
+    main()
